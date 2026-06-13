@@ -1,8 +1,9 @@
 /*
- * VORTECH Compiler - x86-64 Code Emitter
+ * VORTECH Compiler - Native x86-64 Code Emitter
  *
- * Generates Intel-syntax x86-64 assembly.
- * Output can be assembled with GCC or GAS.
+ * Generates x86-64 machine code directly. No external assembler.
+ * Outputs ELF64 relocatable object files (.o).
+ * Uses system linker only for linking with C runtime.
  */
 #ifndef VORTECH_EMIT_H
 #define VORTECH_EMIT_H
@@ -12,11 +13,8 @@
 #include "isel.h"
 #include "regalloc.h"
 
-/* Emit assembly for a machine function to a file */
-void emit_func(FILE *out, MachFunc *mf, RegAllocResult *ra);
-
-/* Emit the full program as an assembly file */
-void emit_program(FILE *out, MachFunc *funcs, uint32_t nfuncs,
-                  RegAllocResult **ras);
+/* Emit all functions as an ELF64 object file */
+bool emit_object(const char *path, MachFunc *funcs, uint32_t nfuncs,
+                 RegAllocResult **ras);
 
 #endif /* VORTECH_EMIT_H */

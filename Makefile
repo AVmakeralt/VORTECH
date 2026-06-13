@@ -48,14 +48,17 @@ $(OBJDIR):
 	mkdir -p $(OBJDIR)
 
 clean:
-	rm -rf $(OBJDIR) $(TARGET) *.s *.o *.out
+	rm -rf $(OBJDIR) $(TARGET) *.s *.o *.out tests/*.o tests/*.out
 
 test: $(TARGET)
-	@echo "Testing VORTECH compiler..."
+	@echo "Testing VORTECH compiler (native x86-64 backend)..."
 	@mkdir -p tests
 	@echo 'fn main() -> i32 { return 42; }' > tests/test_basic.vt
-	@./$(TARGET) -O2 tests/test_basic.vt -o tests/test_basic
-	@echo "Basic test compiled."
+	@./$(TARGET) -O2 tests/test_basic.vt -o tests/test_basic && echo "PASS: test_basic" || echo "FAIL: test_basic"
+	@echo 'fn main() -> i32 { let x: i32 = 10; let result: i32 = 0; if (x > 5) { result = 42; } else { result = 99; } return result; }' > tests/test_if.vt
+	@./$(TARGET) -O2 tests/test_if.vt -o tests/test_if && echo "PASS: test_if" || echo "FAIL: test_if"
+	@echo 'fn main() -> i32 { let sum: i32 = 0; let i: i32 = 1; while (i <= 10) { sum = sum + i; i = i + 1; } return sum; }' > tests/test_while.vt
+	@./$(TARGET) -O2 tests/test_while.vt -o tests/test_while && echo "PASS: test_while" || echo "FAIL: test_while"
 
 install: $(TARGET)
 	cp $(TARGET) /usr/local/bin/

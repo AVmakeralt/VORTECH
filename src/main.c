@@ -6,6 +6,10 @@
  * Pipeline:
  *   Source -> Lexer -> Parser -> AST -> HIR -> SSA -> Optimizations
  *   -> Instruction Selection -> Register Allocation -> Peephole -> Emit
+ *
+ * The backend generates x86-64 machine code directly into ELF64
+ * object files. No external assembler. No GCC for code generation.
+ * The system linker (ld) is used only for linking with C runtime.
  */
 #define _POSIX_C_SOURCE 200809L
 #include "common.h"
@@ -57,8 +61,8 @@ static void print_usage(const char *prog) {
     printf("  --no-verify   Skip SSA verification\n");
     printf("  -h, --help    Show this help\n");
     printf("\n");
-    printf("The output is an x86-64 assembly file (.s) that can be assembled\n");
-    printf("with gcc: gcc -nostdlib -lc output.s -o program\n");
+    printf("Native x86-64 backend. Emits ELF64 object files directly.\n");
+    printf("Uses system linker (ld) only for linking with C runtime.\n");
 }
 
 static VortechConfig parse_args(int argc, char **argv) {
@@ -125,10 +129,37 @@ static char *read_file(const char *path) {
         exit(1);
     }
 
-    size_t read = fread(buf, 1, size, f);
-    buf[read] = '\0';
+    size_t rd = fread(buf, 1, size, f);
+    buf[rd] = '\0';
     fclose(f);
     return buf;
+}
+
+/* Find the path to a crt file for the system linker */
+static char crt1_path[512];
+static char crti_path[512];
+static char crtn_path[512];
+
+static const char *find_crt_file(const char *name, char *buf, size_t bufsize) {
+    /* Common locations for crt files on Linux */
+    static const char *search_paths[] = {
+        "/usr/lib/x86_64-linux-gnu/",
+        "/usr/lib64/",
+        "/usr/lib/",
+        "/lib/x86_64-linux-gnu/",
+        "/lib64/",
+        NULL
+    };
+
+    for (int i = 0; search_paths[i]; i++) {
+        snprintf(buf, bufsize, "%s%s", search_paths[i], name);
+        FILE *f = fopen(buf, "r");
+        if (f) {
+            fclose(f);
+            return buf;
+        }
+    }
+    return NULL;
 }
 
 int main(int argc, char **argv) {
@@ -265,44 +296,59 @@ int main(int argc, char **argv) {
         peephole_run(&mach_funcs[i]);
     }
 
-    /* ---- Stage 8: Code Emission ---- */
-    /* Determine output file name */
-    char *asm_file = NULL;
-    if (cfg.output_file) {
-        size_t len = strlen(cfg.output_file) + 3;
-        asm_file = malloc(len);
-        snprintf(asm_file, len, "%s.s", cfg.output_file);
-    } else {
-        asm_file = strdup("a.out.s");
+    /* ---- Stage 8: Native Code Emission ---- */
+    /* Emit ELF64 object file directly - no external assembler */
+    char *obj_file = NULL;
+    {
+        size_t len = strlen(cfg.output_file) + 4;
+        obj_file = malloc(len);
+        snprintf(obj_file, len, "%s.o", cfg.output_file);
     }
 
-    FILE *out = fopen(asm_file, "w");
-    if (!out) {
-        fprintf(stderr, "vortech: cannot create output file '%s'\n", asm_file);
+    if (!emit_object(obj_file, mach_funcs, ssa_prog->nfuncs, ra_results)) {
+        fprintf(stderr, "vortech: native code emission failed\n");
+        free(obj_file);
+        free(mach_funcs);
+        free(source);
         return 1;
     }
 
-    emit_program(out, mach_funcs, ssa_prog->nfuncs, ra_results);
-    fclose(out);
+    /* ---- Stage 9: Linking ---- */
+    /* Use system linker to create the final executable.
+     * We link against libc for printf (used by the print builtin).
+     * GCC is used only as a linker driver here - it does NOT
+     * generate any code. All machine code is produced by our
+     * own x86-64 binary emitter. */
+    char cmd[2048];
+    const char *output = cfg.output_file ? cfg.output_file : "a.out";
 
-    /* Assemble with gcc */
-    char cmd[1024];
-    snprintf(cmd, sizeof(cmd),
-             "gcc -no-pie %s -lc -o %s 2>&1",
-             asm_file, cfg.output_file ? cfg.output_file : "a.out");
+    /* Try using ld directly with crt files first */
+    const char *crt1 = find_crt_file("crt1.o", crt1_path, sizeof(crt1_path));
+    const char *crti = find_crt_file("crti.o", crti_path, sizeof(crti_path));
+    const char *crtn = find_crt_file("crtn.o", crtn_path, sizeof(crtn_path));
+
+    if (crt1 && crti && crtn) {
+        /* Use ld directly - no GCC involved at all */
+        snprintf(cmd, sizeof(cmd),
+                 "ld -dynamic-linker /lib64/ld-linux-x86-64.so.2 "
+                 "%s %s %s -lc %s -o %s",
+                 crt1, crti, obj_file, crtn, output);
+    } else {
+        /* Fallback: use gcc as linker driver only (no code generation) */
+        snprintf(cmd, sizeof(cmd),
+                 "gcc -no-pie %s -lc -o %s",
+                 obj_file, output);
+    }
 
     int rc = system(cmd);
     if (rc != 0) {
-        fprintf(stderr, "vortech: assembly/linking failed (exit code %d)\n", rc);
-        fprintf(stderr, "  Assembly saved to: %s\n", asm_file);
-        fprintf(stderr, "  Try manually: gcc -no-pie %s -lc -o %s\n",
-                asm_file, cfg.output_file ? cfg.output_file : "a.out");
+        fprintf(stderr, "vortech: linking failed (exit code %d)\n", rc);
+        fprintf(stderr, "  Object file: %s\n", obj_file);
+        fprintf(stderr, "  Try manually: ld %s -lc -o %s\n", obj_file, output);
     } else {
-        /* Remove assembly file on success unless it's explicitly requested */
-        /* Actually, keep it for debugging */
-        fprintf(stderr, "vortech: compiled %s -> %s\n", cfg.input_file,
-                cfg.output_file ? cfg.output_file : "a.out");
-        fprintf(stderr, "  Assembly: %s\n", asm_file);
+        fprintf(stderr, "vortech: compiled %s -> %s (native x86-64)\n",
+                cfg.input_file, output);
+        fprintf(stderr, "  Object file: %s\n", obj_file);
     }
 
     /* Cleanup */
@@ -312,8 +358,8 @@ int main(int argc, char **argv) {
     free(ra_results);
     free(mach_funcs);
     arena_destroy(mach_arena);
-    free(asm_file);
+    free(obj_file);
     free(source);
 
-    return 0;
+    return rc;
 }
