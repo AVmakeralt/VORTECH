@@ -129,7 +129,7 @@ MachFunc *isel_select(Arena *arena, SsaFunc *ssa_func) {
                     break;
                 case BINOP_MOD:
                     mach_block_emit(&mf->blocks[bi],
-                        mach_inst(MINST_DIV, inst->dst, inst->binop.lhs, inst->binop.rhs,
+                        mach_inst(MINST_MOD, inst->dst, inst->binop.lhs, inst->binop.rhs,
                                   0, inst->dst_type));
                     break;
                 case BINOP_AND:
@@ -306,10 +306,42 @@ MachFunc *isel_select(Arena *arena, SsaFunc *ssa_func) {
     }
 
     /* ---- PHI Elimination Pass ---- */
-    /* Now that all blocks are built, insert MOV copies for PHI nodes.
-     * For each PHI in block B: dst = phi(pred0:src0, pred1:src1, ...),
-     * insert "mov dst, srcN" at the end of each predecessor predN,
-     * just before the terminator instruction. */
+    /* Insert MOV copies for PHI nodes. We need to handle two cases:
+     *
+     * 1. Unconditional JMP predecessors: insert copies before the JMP.
+     *    This is safe because JMP has exactly one successor.
+     *
+     * 2. Conditional branch (TEST+JNE+JMP) predecessors: inserting copies
+     *    before either branch would execute them on BOTH paths (critical
+     *    edge problem). We solve this with edge splitting: redirect the
+     *    branch through a new "edge block" containing the copies + JMP.
+     *
+     * We first collect ALL copies needed for each (predecessor, PHI-block)
+     * edge, then process them. This avoids creating multiple edge blocks
+     * for the same edge when multiple PHIs share the same predecessor. */
+
+    /* Collect copies per (pred_bb, phi_bb) edge */
+    typedef struct {
+        uint32_t dst;
+        uint32_t src;
+    } PhiCopy;
+
+    typedef struct {
+        uint32_t pred_bb;
+        uint32_t phi_bb;
+        PhiCopy *copies;
+        uint32_t ncopy;
+        uint32_t copies_cap;
+    } EdgeCopies;
+
+    EdgeCopies *edges = NULL;
+    uint32_t nedges = 0;
+    uint32_t edges_cap = 0;
+
+    /* Helper: find or create an edge entry */
+    /* (inline the logic instead of using nested functions for C11 portability) */
+
+    /* Collect copies from all PHI nodes */
     for (uint32_t bi = 0; bi < ssa_func->nblocks; bi++) {
         SsaBlock *sblk = &ssa_func->blocks[bi];
         for (uint32_t ii = 0; ii < sblk->ninsts; ii++) {
@@ -317,38 +349,160 @@ MachFunc *isel_select(Arena *arena, SsaFunc *ssa_func) {
             if (inst->op != OP_PHI) continue;
 
             for (uint32_t pi = 0; pi < inst->phi.n; pi++) {
+                if (inst->phi.srcs[pi] == inst->dst) continue; /* trivial */
+
                 uint32_t pred_bb = inst->phi.preds[pi];
                 if (pred_bb >= mf->nblocks) continue;
 
-                MachInst mi = mach_inst(MINST_MOV, inst->dst, inst->phi.srcs[pi], 0, 0,
-                                         inst->dst_type ? inst->dst_type : vt_type_make(arena, VTTYPE_I64));
-                MachBlock *pblk = &mf->blocks[pred_bb];
-
-                /* Insert before the terminator (last instruction) */
-                if (pblk->ninsts > 0) {
-                    MachInst *last = &pblk->insts[pblk->ninsts - 1];
-                    if (last->op == MINST_JMP || last->op == MINST_JE ||
-                        last->op == MINST_JNE || last->op == MINST_RET) {
-                        /* Ensure capacity */
-                        if (pblk->ninsts >= pblk->insts_cap) {
-                            pblk->insts_cap = pblk->ninsts * 2 + 4;
-                            pblk->insts = realloc(pblk->insts, sizeof(MachInst) * pblk->insts_cap);
-                            if (!pblk->insts) { fprintf(stderr, "out of memory\n"); exit(1); }
-                        }
-                        /* Shift terminator right by 1 */
-                        pblk->insts[pblk->ninsts] = pblk->insts[pblk->ninsts - 1];
-                        /* Insert copy before terminator */
-                        pblk->insts[pblk->ninsts - 1] = mi;
-                        pblk->ninsts++;
-                    } else {
-                        mach_block_emit(pblk, mi);
-                    }
-                } else {
-                    mach_block_emit(pblk, mi);
+                /* Find or create edge entry for (pred_bb, bi) */
+                uint32_t ei = nedges;
+                for (uint32_t e = 0; e < nedges; e++) {
+                    if (edges[e].pred_bb == pred_bb && edges[e].phi_bb == bi) { ei = e; break; }
                 }
+                if (ei == nedges) {
+                    if (nedges >= edges_cap) {
+                        edges_cap = edges_cap ? edges_cap * 2 : 16;
+                        edges = realloc(edges, sizeof(EdgeCopies) * edges_cap);
+                        if (!edges) { fprintf(stderr, "out of memory\n"); exit(1); }
+                    }
+                    edges[nedges].pred_bb = pred_bb;
+                    edges[nedges].phi_bb = bi;
+                    edges[nedges].copies = NULL;
+                    edges[nedges].ncopy = 0;
+                    edges[nedges].copies_cap = 0;
+                    nedges++;
+                }
+                EdgeCopies *ec = &edges[ei];
+                if (ec->ncopy >= ec->copies_cap) {
+                    ec->copies_cap = ec->copies_cap ? ec->copies_cap * 2 : 4;
+                    ec->copies = realloc(ec->copies, sizeof(PhiCopy) * ec->copies_cap);
+                    if (!ec->copies) { fprintf(stderr, "out of memory\n"); exit(1); }
+                }
+                ec->copies[ec->ncopy].dst = inst->dst;
+                ec->copies[ec->ncopy].src = inst->phi.srcs[pi];
+                ec->ncopy++;
             }
         }
     }
+
+    /* Now process each edge */
+    for (uint32_t ei = 0; ei < nedges; ei++) {
+        EdgeCopies *ec = &edges[ei];
+        if (ec->ncopy == 0) continue;
+
+        uint32_t pred_bb = ec->pred_bb;
+        uint32_t phi_bb = ec->phi_bb;
+        MachBlock *pblk = &mf->blocks[pred_bb];
+
+        if (pblk->ninsts == 0) {
+            /* Empty predecessor — just emit copies */
+            for (uint32_t ci = 0; ci < ec->ncopy; ci++) {
+                MachInst mi = mach_inst(MINST_MOV, ec->copies[ci].dst, ec->copies[ci].src, 0, 0,
+                                         vt_type_make(arena, VTTYPE_I64));
+                mach_block_emit(pblk, mi);
+            }
+            continue;
+        }
+
+        MachInst *last = &pblk->insts[pblk->ninsts - 1];
+
+        if (last->op == MINST_JMP) {
+            /* Check if this JMP is part of a TEST+JNE+JMP pattern */
+            bool is_conditional_jmp = false;
+            MachInst *jne_inst = NULL;
+            if (pblk->ninsts >= 2) {
+                MachInst *prev = &pblk->insts[pblk->ninsts - 2];
+                if (prev->op == MINST_JNE || prev->op == MINST_JE) {
+                    is_conditional_jmp = true;
+                    jne_inst = prev;
+                }
+            }
+
+            if (is_conditional_jmp && jne_inst && jne_inst->target_bb == phi_bb) {
+                /* JNE/JE target goes to the PHI block — need edge splitting */
+                uint32_t edge_bb = mf->nblocks;
+                mf->nblocks++;
+                mf->blocks = realloc(mf->blocks, sizeof(MachBlock) * mf->nblocks);
+                if (!mf->blocks) { fprintf(stderr, "out of memory\n"); exit(1); }
+                memset(&mf->blocks[edge_bb], 0, sizeof(MachBlock));
+                mf->blocks[edge_bb].label = edge_bb;
+                mf->blocks[edge_bb].insts_cap = ec->ncopy + 2;
+                mf->blocks[edge_bb].insts = calloc(mf->blocks[edge_bb].insts_cap, sizeof(MachInst));
+
+                /* Emit all PHI copies in edge block */
+                for (uint32_t ci = 0; ci < ec->ncopy; ci++) {
+                    MachInst mi = mach_inst(MINST_MOV, ec->copies[ci].dst, ec->copies[ci].src, 0, 0,
+                                             vt_type_make(arena, VTTYPE_I64));
+                    mach_block_emit(&mf->blocks[edge_bb], mi);
+                }
+
+                /* JMP from edge block to PHI block */
+                MachInst jmp;
+                memset(&jmp, 0, sizeof(jmp));
+                jmp.op = MINST_JMP;
+                jmp.target_bb = phi_bb;
+                mach_block_emit(&mf->blocks[edge_bb], jmp);
+
+                /* Redirect JNE to edge block */
+                jne_inst->target_bb = edge_bb;
+
+            } else if (last->target_bb == phi_bb) {
+                /* JMP target goes to PHI block — insert copies before JMP */
+                /* Ensure capacity for all copies */
+                while (pblk->ninsts + ec->ncopy > pblk->insts_cap) {
+                    pblk->insts_cap = pblk->insts_cap * 2 + 4;
+                    pblk->insts = realloc(pblk->insts, sizeof(MachInst) * pblk->insts_cap);
+                    if (!pblk->insts) { fprintf(stderr, "out of memory\n"); exit(1); }
+                }
+                /* Shift JMP and everything after it right by ncopy */
+                uint32_t insert_pos = pblk->ninsts - 1; /* position of JMP */
+                memmove(&pblk->insts[insert_pos + ec->ncopy], &pblk->insts[insert_pos],
+                        sizeof(MachInst)); /* just the JMP */
+                /* Insert copies */
+                for (uint32_t ci = 0; ci < ec->ncopy; ci++) {
+                    pblk->insts[insert_pos + ci] = mach_inst(
+                        MINST_MOV, ec->copies[ci].dst, ec->copies[ci].src, 0, 0,
+                        vt_type_make(arena, VTTYPE_I64));
+                }
+                pblk->ninsts += ec->ncopy;
+            }
+            /* else: neither target matches this PHI block, skip */
+
+        } else if (last->op == MINST_JNE || last->op == MINST_JE) {
+            /* Standalone conditional branch */
+            if (last->target_bb == phi_bb) {
+                uint32_t edge_bb = mf->nblocks;
+                mf->nblocks++;
+                mf->blocks = realloc(mf->blocks, sizeof(MachBlock) * mf->nblocks);
+                if (!mf->blocks) { fprintf(stderr, "out of memory\n"); exit(1); }
+                memset(&mf->blocks[edge_bb], 0, sizeof(MachBlock));
+                mf->blocks[edge_bb].label = edge_bb;
+                mf->blocks[edge_bb].insts_cap = ec->ncopy + 2;
+                mf->blocks[edge_bb].insts = calloc(mf->blocks[edge_bb].insts_cap, sizeof(MachInst));
+
+                for (uint32_t ci = 0; ci < ec->ncopy; ci++) {
+                    MachInst mi = mach_inst(MINST_MOV, ec->copies[ci].dst, ec->copies[ci].src, 0, 0,
+                                             vt_type_make(arena, VTTYPE_I64));
+                    mach_block_emit(&mf->blocks[edge_bb], mi);
+                }
+                MachInst jmp;
+                memset(&jmp, 0, sizeof(jmp));
+                jmp.op = MINST_JMP;
+                jmp.target_bb = phi_bb;
+                mach_block_emit(&mf->blocks[edge_bb], jmp);
+
+                last = &pblk->insts[pblk->ninsts - 1];
+                last->target_bb = edge_bb;
+            }
+        }
+        /* RET or other — skip (PHI shouldn't be reached from RET) */
+    }
+
+    /* Cleanup */
+    for (uint32_t ei = 0; ei < nedges; ei++) {
+        free(edges[ei].copies);
+    }
+    free(edges);
 
     return mf;
 }
@@ -365,6 +519,7 @@ static const char *mach_op_str(MachOpcode op) {
     case MINST_MUL:      return "imul";
     case MINST_MUL_IMM:  return "imul";
     case MINST_DIV:      return "idiv";
+    case MINST_MOD:      return "imod";
     case MINST_AND:      return "and";
     case MINST_OR:       return "or";
     case MINST_XOR:      return "xor";

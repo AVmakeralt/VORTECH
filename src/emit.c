@@ -947,6 +947,36 @@ static void emit_inst_binary(Emitter *em, MachInst *mi, RegAllocResult *ra) {
         break;
     }
 
+    case MINST_MOD: {
+        X86Reg dst = (X86Reg)mi->dst;
+        X86Reg lhs = (X86Reg)mi->src;
+        X86Reg rhs = (X86Reg)mi->src2;
+        if (!reg_valid(rhs)) break;
+        X86Reg lhs_reg = reg_valid(lhs) ? lhs : REG_RAX;
+
+        /* Save RDX on stack (CQO will overwrite it, and any vreg
+         * allocated to RDX that's live across this point would be lost).
+         * We use MOV [RSP-8], RDX and then MOV RDX, [RSP-8] to avoid
+         * changing RSP (which would mess up stack-relative offsets). */
+        cb_push1(cb, 0x48); cb_push2(cb, 0x89, 0x54); cb_push2(cb, 0x24, 0xF8); /* mov [rsp-8], rdx */
+
+        /* Move lhs to RAX if not already there */
+        if (lhs_reg != REG_RAX) {
+            enc_mov64(cb, REG_RAX, lhs_reg);
+        }
+        /* CQO: sign-extend RAX into RDX:RAX */
+        enc_cqo(cb);
+        /* IDIV rhs — quotient in RAX, remainder in RDX */
+        enc_idiv64(cb, rhs);
+        /* Move remainder from RDX to dst */
+        if (reg_valid(dst) && dst != REG_RDX) {
+            enc_mov64(cb, dst, REG_RDX);
+        }
+        /* Restore RDX from stack */
+        cb_push1(cb, 0x48); cb_push2(cb, 0x8B, 0x54); cb_push2(cb, 0x24, 0xF8); /* mov rdx, [rsp-8] */
+        break;
+    }
+
     case MINST_AND: {
         X86Reg dst = (X86Reg)mi->dst;
         X86Reg src = (X86Reg)mi->src;
@@ -1174,6 +1204,12 @@ static void emit_inst_binary(Emitter *em, MachInst *mi, RegAllocResult *ra) {
         const char *func_name = mi->func_name ? mi->func_name : "???";
         uint32_t sym_idx = emitter_ensure_extern(em, func_name);
         emitter_add_reloc(em, (uint32_t)rel32_off, R_X86_64_PLT32, sym_idx, -4);
+
+        /* Move return value from RAX to destination register */
+        X86Reg dst = (X86Reg)mi->dst;
+        if (reg_valid(dst) && dst != REG_RAX) {
+            enc_mov64(cb, dst, REG_RAX);
+        }
         break;
     }
 

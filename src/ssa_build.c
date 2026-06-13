@@ -760,30 +760,33 @@ static uint32_t ssa_build_expr(SsaBuildCtx *ctx, HirNode *hir) {
         return inst->dst;
     }
     case HIR_CALL_EXPR: {
-        SsaInst *inst = ssa_builder_emit(b, OP_CALL, hir->type);
-        inst->call.func_name = hir->call_expr.name;
-        inst->call.nargs = hir->call_expr.nargs;
-        inst->call.is_extern = true;
-        inst->call.args = arena_calloc(ctx->arena, hir->call_expr.nargs, sizeof(uint32_t));
+        /* Evaluate all arguments FIRST, before emitting the CALL instruction.
+         * This ensures argument definitions (CONST, BINOP, etc.) appear before
+         * the CALL in the instruction stream. */
+        uint32_t *arg_vregs = arena_calloc(ctx->arena, hir->call_expr.nargs, sizeof(uint32_t));
         for (uint32_t i = 0; i < hir->call_expr.nargs; i++) {
-            inst->call.args[i] = ssa_build_expr(ctx, hir->call_expr.args[i]);
+            arg_vregs[i] = ssa_build_expr(ctx, hir->call_expr.args[i]);
         }
 
+        /* Handle print as a special intrinsic */
         if (strcmp(hir->call_expr.name, "print") == 0) {
             if (hir->call_expr.nargs > 0) {
                 SsaInst pi;
                 memset(&pi, 0, sizeof(pi));
                 pi.op = OP_PRINT;
                 pi.dst = VT_INVALID_VREG;
-                pi.print.val = inst->call.args[0];
+                pi.print.val = arg_vregs[0];
                 ssa_builder_emit_inst(b, &pi);
             }
-            /* Don't also emit the CALL - print is handled by OP_PRINT */
-            /* Mark the CALL instruction as dead (will be removed by DCE) */
-            inst->op = OP_CONST;
-            inst->const_.value = 0;
             return VT_INVALID_VREG;
         }
+
+        /* Now emit the CALL instruction after all arguments are ready */
+        SsaInst *inst = ssa_builder_emit(b, OP_CALL, hir->type);
+        inst->call.func_name = hir->call_expr.name;
+        inst->call.nargs = hir->call_expr.nargs;
+        inst->call.is_extern = true;
+        inst->call.args = arg_vregs;
 
         return inst->dst;
     }

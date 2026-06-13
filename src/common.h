@@ -274,6 +274,7 @@ typedef enum {
     MINST_MUL,         /* imul dst, src           */
     MINST_MUL_IMM,     /* imul dst, imm           */
     MINST_DIV,         /* idiv src (rax /= src)   */
+    MINST_MOD,         /* idiv src (rdx = rax % src) */
     MINST_AND,         /* and dst, src            */
     MINST_OR,          /* or  dst, src            */
     MINST_XOR,         /* xor dst, src            */
@@ -391,7 +392,7 @@ static inline bool reg_is_callee_saved(X86Reg r) {
 }
 
 /* Number of allocatable GPRs (excluding RSP, RBP) */
-#define VT_NUM_ALLOC_GPRS  12  /* rax, rcx, rdx, rbx, rsi, rdi, r8-r15 */
+#define VT_NUM_ALLOC_GPRS  14  /* rax, rcx, rdx, rbx, rsi, rdi, r8-r15 */
 #define VT_NUM_ALLOC_XMMS  8
 
 /* Allocatable GPRs in preference order */
