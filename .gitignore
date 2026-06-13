@@ -1,0 +1,40 @@
+# Build artifacts
+*.o
+*.out
+*.exe
+vortech
+vortech-debug
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Editor files
+*.swp
+*.swo
+*~
+.vscode/
+.idea/
+*.sublime-*
+
+# Debug files
+*.dSYM/
+*.su
+*.idb
+*.pdb
+
+# Dependency dirs
+deps/
+third_party/
+
+# NEVER commit skill files or home directory content
+skills/
+.skill*
+/home/
+~/ 
+*.skill
+
+# Generated test output
+tests/*.s
+tests/*.o
+tests/*.out
