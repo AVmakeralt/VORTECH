@@ -1,0 +1,10 @@
+fn main() -> i32 {
+    let x: i32 = 10;
+    let result: i32 = 0;
+    if (x > 5) {
+        result = 42;
+    } else {
+        result = 99;
+    }
+    return result;
+}
